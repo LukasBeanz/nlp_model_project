@@ -5,9 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="414d5008-7c21-40a6-bcc0-7b00b04d2707" name="변경" comment="최초 커밋">
-      <change afterPath="$PROJECT_DIR$/assignment/LSTM_movie_review.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/assignment/__init__.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/assignment/LSTM_movie_review.py" beforeDir="false" afterPath="$PROJECT_DIR$/assignment/LSTM_movie_review.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -177,7 +176,7 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/assignment/LSTM_movie_review.py</url>
-          <line>33</line>
+          <line>32</line>
           <option name="timeStamp" value="2" />
         </line-breakpoint>
       </breakpoints>

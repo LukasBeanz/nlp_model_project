@@ -44,9 +44,6 @@ from collections import Counter
 # NSMC 는 탭으로 구분된 텍스트 파일이라 pandas 로 읽고 정제합니다.
 import pandas as pd
 
-# 통합 데이터(ratings.txt)를 훈련/테스트로 나누기 위해 사용합니다.
-from sklearn.model_selection import train_test_split
-
 # PyTorch 핵심 라이브러리입니다.
 import torch
 
@@ -77,16 +74,13 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 # -------------------------------------------------
 
-# NSMC 데이터 파일을 pandas DataFrame 으로 읽고 정제하는 함수입니다.
-# 파일이 로컬에 없으면 url 에서 내려받습니다. (이미 data 폴더에 있으면 그대로 사용)
-def load_nsmc(path: str, url: str | None = None) -> pd.DataFrame:
+# NSMC 데이터 파일을 내려받아 pandas DataFrame 으로 읽고 정제하는 함수입니다.
+def load_nsmc(url: str, path: str) -> pd.DataFrame:
     # 저장할 디렉토리가 없으면 만듭니다.
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    # 파일이 없고 url 이 주어졌으면 인터넷에서 내려받습니다.
+    # 파일이 없으면 인터넷에서 내려받습니다.
     if not os.path.exists(path):
-        if url is None:
-            raise FileNotFoundError(f"데이터 파일이 없습니다: {path}")
         print(f"다운로드 중: {url}")
         urllib.request.urlretrieve(url, filename=path)
 
@@ -285,9 +279,9 @@ class RNNModel(pl.LightningModule):
 # 5. 전체 실행 흐름
 # ---------------------------------------------------------------------
 
-# NSMC 통합 데이터 파일 (data 폴더에 이미 있으면 그대로 사용, 없으면 아래 URL 에서 다운로드)
-DATA_PATH = "./data/ratings.txt"
-DATA_URL = "https://raw.githubusercontent.com/e9t/nsmc/master/ratings.txt"
+# NSMC 데이터 파일 URL (네이버 영화 리뷰 데이터 공개 저장소)
+TRAIN_URL = "https://raw.githubusercontent.com/e9t/nsmc/master/ratings_train.txt"
+TEST_URL = "https://raw.githubusercontent.com/e9t/nsmc/master/ratings_test.txt"
 
 # 데이터 준비, 모델 생성, 학습, 평가를 수행하는 메인 함수입니다.
 def main() -> None:
@@ -298,18 +292,10 @@ def main() -> None:
     max_len = 40
     batch_size = 64
 
-    # NSMC 통합 데이터를 읽고 정제한 뒤, 훈련/테스트로 8:2 분할합니다.
+    # NSMC 훈련/테스트 데이터를 내려받아 정제합니다.
     print("NSMC 데이터셋을 불러오는 중...")
-    data = load_nsmc(DATA_PATH, DATA_URL)
-    print("전체 샘플 수(정제 후):", len(data))
-
-    # 라벨 비율(긍정/부정)을 유지하며 훈련 80% / 테스트 20% 로 나눕니다.
-    train_df, test_df = train_test_split(
-        data,
-        test_size=0.2,
-        random_state=42,
-        stratify=data["label"],
-    )
+    train_df = load_nsmc(TRAIN_URL, "./data/ratings_train.txt")
+    test_df = load_nsmc(TEST_URL, "./data/ratings_test.txt")
 
     print("훈련 샘플 수:", len(train_df), "/ 테스트 샘플 수:", len(test_df))
 
