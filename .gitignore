@@ -30,6 +30,7 @@ dist/
 # Dataset files downloaded during execution
 spam.csv
 *.csv
+data/
 
 # Model checkpoint / trained model files
 *.pt
