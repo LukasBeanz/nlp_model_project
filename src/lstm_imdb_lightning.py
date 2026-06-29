@@ -1,341 +1,479 @@
 # -*- coding: utf-8 -*-
 """
-IMDB 영화 리뷰 감성 분류(긍정 pos / 부정 neg) — LSTM + PyTorch Lightning (현대화 버전)
-
-[원본과의 차이]
-원본 코드는 torchtext.legacy API(Field, BucketIterator, IMDB)를 사용했으나,
-torchtext.legacy 는 최신 torchtext(0.12+)에서 완전히 제거되어 더 이상 동작하지 않습니다.
-그래서 이 파일은 다음과 같이 현대적인 방식으로 재작성했습니다.
-
-    - 데이터셋:   torchtext.legacy.datasets.IMDB  ->  HuggingFace datasets 의 load_dataset("imdb")
-    - 전처리:     torchtext Field                 ->  직접 구현한 토크나이저 + 단어 사전(vocab)
-    - 데이터로더: BucketIterator                  ->  torch.utils.data 의 Dataset + DataLoader
-    - 임베딩:     vocab.vectors(FastText) 인덱싱  ->  학습 가능한 nn.Embedding 계층
-    - 지표:       pl.metrics.Accuracy            ->  torchmetrics.Accuracy
-    - 클래스 수:  output_size=3(legacy <unk> 라벨) ->  output_size=2(pos/neg 그대로 0/1)
-    - 실행:       모듈 최상위 실행              ->  main() + if __name__ == "__main__" 가드
-
-[필요 패키지]
-    pip install torch pytorch-lightning torchmetrics datasets
-
-[전체 실행 흐름]
-    1. 라이브러리 불러오기
-    2. 토크나이저 / 단어 사전 / 인코딩 함수 정의
-    3. PyTorch Dataset 클래스 정의
-    4. PyTorch Lightning 기반 LSTM 모델 정의
-    5. main(): 데이터 로드 -> 사전 생성 -> DataLoader -> 모델 생성 -> 학습
+IMDB 영화 리뷰 감성 분석 LSTM 모델 - PyTorch Lightning 정상 실행 버전
 """
 
 # ---------------------------------------------------------------------
-# 1. 필요한 라이브러리 불러오기
+# 1. 기본 라이브러리 불러오기
 # ---------------------------------------------------------------------
 
-# 정규식으로 간단한 영어 토큰화를 수행하기 위해 사용합니다.
+import os
 import re
-
-# 난수 시드를 고정하기 위해 사용합니다.
+import tarfile
 import random
+import urllib.request
 
-# 단어 빈도수를 세기 위해 사용합니다.
 from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-# PyTorch 핵심 라이브러리입니다. 텐서 연산, GPU 사용, 학습 등에 사용됩니다.
+# ---------------------------------------------------------------------
+# 2. 딥러닝 라이브러리 불러오기
+# ---------------------------------------------------------------------
+
 import torch
-
-# 신경망 계층(LSTM, Linear 등)을 만들 때 사용하는 모듈입니다.
 import torch.nn as nn
 
-# 활성화 함수 등을 함수 형태로 사용합니다. 여기서는 ELU 활성화 함수 F.elu()를 사용합니다.
-import torch.nn.functional as F
-
-# 사용자 정의 데이터셋과 미니배치 공급용 데이터 로더를 만들기 위해 사용합니다.
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import random_split
 
-# PyTorch Lightning은 학습 루프를 구조적으로 관리해 주는 라이브러리입니다.
 import pytorch_lightning as pl
 
-# torchmetrics는 정확도 등 평가 지표를 계산하는 최신 라이브러리입니다.
-from torchmetrics import Accuracy
-
-# HuggingFace datasets 는 IMDB 등 표준 데이터셋을 손쉽게 내려받고 다루게 해 줍니다.
-from datasets import load_dataset
+from torchmetrics.classification import BinaryAccuracy
 
 
 # ---------------------------------------------------------------------
-# 2. 토크나이저 / 단어 사전 / 인코딩 함수
+# 3. 설정값 정의
 # ---------------------------------------------------------------------
 
-# 난수 시드를 고정하여 실행할 때마다 최대한 비슷한 결과가 나오게 합니다.
-def set_seed(seed: int = 42) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-# -------------------------------------------------
+@dataclass
+class Config:
+    """프로젝트 전체에서 사용할 설정값을 저장하는 클래스입니다."""
 
-# 간단한 영어 토큰화를 수행하는 함수입니다.
-def simple_tokenize(text: str) -> list[str]:
-    # 소문자로 변환합니다.
-    text = str(text).lower()
+    data_url: str = "https://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz"
+    data_dir: str = "../data"
+    archive_name: str = "aclImdb_v1.tar.gz"
+    dataset_folder: str = "aclImdb"
+    max_len: int = 200
+    max_vocab_size: int = 20000
+    min_freq: int = 2
+    batch_size: int = 64
+    embedding_dim: int = 128
+    hidden_dim: int = 128
+    num_layers: int = 1
+    dropout: float = 0.3
+    learning_rate: float = 0.001
+    max_epochs: int = 3
+    val_ratio: float = 0.2
+    num_workers: int = 0
+    seed: int = 42
+    use_toy_data_if_download_fails: bool = True
 
-    # 알파벳/숫자/작은따옴표로 이루어진 덩어리만 단어로 추출합니다.
-    # 이렇게 하면 HTML 태그(<br />)나 문장 부호를 자연스럽게 걸러낼 수 있습니다.
-    tokens = re.findall(r"[a-z0-9']+", text)
 
-    return tokens
-# -------------------------------------------------
+# ---------------------------------------------------------------------
+# 4. 텍스트 전처리 함수
+# ---------------------------------------------------------------------
 
-# 훈련 데이터로부터 단어 사전(word -> index)을 만드는 함수입니다.
-def build_vocab(texts, min_freq: int = 2, max_size: int = 20000) -> dict[str, int]:
-    # 모든 단어의 등장 횟수를 누적할 Counter 객체를 만듭니다.
-    counter = Counter()
+def clean_text(text: str) -> str:
+    """영화 리뷰 원문을 모델에 넣기 쉬운 형태로 정리합니다."""
 
-    # 각 문장을 토큰화하여 단어 빈도를 누적합니다.
-    for text in texts:
-        counter.update(simple_tokenize(text))
-    # for ----------------
+    text = re.sub(r"<.*?>", " ", text)
+    text = re.sub(r"[^a-zA-Z0-9!?.,' ]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    text = text.lower().strip()
 
-    # 0번은 패딩 토큰, 1번은 미등록 단어(<UNK>) 토큰으로 예약합니다.
-    word_to_index = {"<PAD>": 0, "<UNK>": 1}
+    return text
 
-    # 빈도가 높은 단어부터 최대 max_size 개까지 사전에 추가합니다.
-    for word, freq in counter.most_common(max_size):
-        # min_freq 이상 등장한 단어만 포함합니다.
-        if freq >= min_freq:
+
+def tokenize(text: str) -> List[str]:
+    """문장을 단어 리스트로 분리합니다."""
+
+    return clean_text(text).split()
+
+
+# ---------------------------------------------------------------------
+# 5. IMDB 데이터 다운로드 및 로드 함수
+# ---------------------------------------------------------------------
+
+def download_and_extract_imdb(config: Config) -> Path:
+    """IMDB 데이터셋이 없으면 다운로드하고 압축을 해제합니다."""
+
+    data_dir = Path(config.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    dataset_path = data_dir / config.dataset_folder
+
+    if dataset_path.exists():
+        print(f"[데이터 확인] 기존 IMDB 데이터셋 사용: {dataset_path}")
+        return dataset_path
+
+    archive_path = data_dir / config.archive_name
+
+    if not archive_path.exists():
+        print("[데이터 다운로드] IMDB 데이터셋 다운로드를 시작합니다.")
+        print(f"[URL] {config.data_url}")
+        urllib.request.urlretrieve(config.data_url, archive_path)
+        print(f"[데이터 다운로드 완료] {archive_path}")
+
+    print("[압축 해제] IMDB 데이터셋 압축을 해제합니다.")
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(path=data_dir)
+
+    print(f"[압축 해제 완료] {dataset_path}")
+    return dataset_path
+
+
+def read_imdb_split(dataset_path: Path, split: str) -> List[Tuple[str, int]]:
+    """IMDB train 또는 test 폴더에서 리뷰 텍스트와 라벨을 읽어옵니다."""
+
+    samples: List[Tuple[str, int]] = []
+    label_map = {"neg": 0, "pos": 1}
+
+    for label_name, label_id in label_map.items():
+
+        review_dir = dataset_path / split / label_name
+
+        if not review_dir.exists():
+            raise FileNotFoundError(f"리뷰 폴더를 찾을 수 없습니다: {review_dir}")
+
+        for file_path in sorted(review_dir.glob("*.txt")):
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+            samples.append((text, label_id))
+
+    random.shuffle(samples)
+    return samples
+
+
+def make_toy_samples() -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """인터넷 다운로드가 불가능할 때 실행 확인용 작은 예제 데이터를 만듭니다."""
+
+    positive = [
+        "This movie was wonderful and I loved every moment",
+        "The story was beautiful and the acting was excellent",
+        "A fantastic film with great characters",
+        "I really enjoyed this movie it was amazing",
+        "The plot was touching and the music was great",
+        "Brilliant movie with a very satisfying ending",
+        "The performances were strong and emotional",
+        "This is one of the best films I have watched",
+    ]
+
+    negative = [
+        "This movie was terrible and boring",
+        "The story was weak and the acting was bad",
+        "A disappointing film with poor characters",
+        "I did not enjoy this movie it was awful",
+        "The plot was confusing and the music was annoying",
+        "Bad movie with a very unsatisfying ending",
+        "The performances were weak and emotionless",
+        "This is one of the worst films I have watched",
+    ]
+
+    samples = [(text, 1) for text in positive] + [(text, 0) for text in negative]
+    samples = samples * 20
+    random.shuffle(samples)
+
+    split_idx = int(len(samples) * 0.8)
+    return samples[:split_idx], samples[split_idx:]
+
+
+def load_data(config: Config) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """IMDB 데이터를 로드하고, 실패하면 선택적으로 예제 데이터를 반환합니다."""
+
+    try:
+        dataset_path = download_and_extract_imdb(config)
+        train_samples = read_imdb_split(dataset_path, "train")
+        test_samples = read_imdb_split(dataset_path, "test")
+
+        print(f"[데이터 로드 완료] train={len(train_samples)}, test={len(test_samples)}")
+        return train_samples, test_samples
+
+    except Exception as error:
+        print(f"[경고] IMDB 원본 데이터 로드 실패: {error}")
+
+        if not config.use_toy_data_if_download_fails:
+            raise
+
+        print("[대체 실행] 인터넷 다운로드가 불가능하여 작은 예제 데이터로 실행합니다.")
+        return make_toy_samples()
+
+
+# ---------------------------------------------------------------------
+# 6. Vocabulary 생성 함수
+# ---------------------------------------------------------------------
+
+def build_vocab(samples: List[Tuple[str, int]], config: Config) -> Dict[str, int]:
+    """훈련 데이터에서 단어 사전을 만듭니다."""
+
+    counter: Counter = Counter()
+
+    for text, _ in samples:
+        counter.update(tokenize(text))
+
+    word_to_index: Dict[str, int] = {"<pad>": 0, "<unk>": 1}
+
+    for word, freq in counter.most_common(config.max_vocab_size - len(word_to_index)):
+
+        if freq < config.min_freq:
+            continue
+
+        if word not in word_to_index:
             word_to_index[word] = len(word_to_index)
-    # for ----------------
 
+    print(f"[Vocabulary 생성 완료] 단어 수: {len(word_to_index)}")
     return word_to_index
-# -------------------------------------------------
 
-# 한 문장을 정수 인덱스 시퀀스로 바꾸고, 고정 길이로 패딩/절단하는 함수입니다.
-def encode_and_pad(text: str, word_to_index: dict[str, int], max_len: int) -> list[int]:
-    # 문장을 토큰화합니다.
-    tokens = simple_tokenize(text)
 
-    # 각 단어를 사전 번호로 변환하고, 사전에 없으면 <UNK> 번호 1을 사용합니다.
-    encoded = [word_to_index.get(token, 1) for token in tokens]
+def encode_text(text: str, word_to_index: Dict[str, int], max_len: int) -> torch.Tensor:
+    """문장 하나를 고정 길이 정수 텐서로 변환합니다."""
 
-    # max_len 보다 길면 앞에서부터 max_len 까지 자릅니다.
-    encoded = encoded[:max_len]
+    tokens = tokenize(text)
+    token_ids = [word_to_index.get(token, word_to_index["<unk>"]) for token in tokens]
+    token_ids = token_ids[:max_len]
 
-    # max_len 보다 짧으면 뒤쪽을 <PAD> 번호 0으로 채워 길이를 맞춥니다.
-    padded = encoded + [0] * (max_len - len(encoded))
+    if len(token_ids) < max_len:
+        token_ids = token_ids + [word_to_index["<pad>"]] * (max_len - len(token_ids))
 
-    return padded
-# -------------------------------------------------
+    return torch.tensor(token_ids, dtype=torch.long)
 
 
 # ---------------------------------------------------------------------
-# 3. PyTorch Dataset 클래스 정의
+# 7. Dataset 클래스 정의
 # ---------------------------------------------------------------------
 
-# 리뷰 문장과 라벨을 DataLoader 가 읽을 수 있도록 구성하는 Dataset 클래스입니다.
 class IMDBDataset(Dataset):
-    # 문장, 라벨, 단어 사전, 최대 길이를 받아 저장합니다.
-    def __init__(self, texts, labels, word_to_index: dict[str, int], max_len: int):
-        self.texts = list(texts)
-        self.labels = list(labels)
+    """IMDB 리뷰 텍스트와 라벨을 PyTorch Dataset 형태로 제공하는 클래스입니다."""
+
+    def __init__(self, samples: List[Tuple[str, int]], word_to_index: Dict[str, int], max_len: int):
+        self.samples = samples
         self.word_to_index = word_to_index
         self.max_len = max_len
 
-    # 전체 샘플 개수를 반환합니다.
     def __len__(self) -> int:
-        return len(self.texts)
+        return len(self.samples)
 
-    # 특정 인덱스 하나에 해당하는 (입력 텐서, 정답 텐서)를 반환합니다.
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        # 문장을 정수 시퀀스로 변환하고 패딩합니다.
-        x = encode_and_pad(self.texts[index], self.word_to_index, self.max_len)
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        text, label = self.samples[index]
+        input_ids = encode_text(text, self.word_to_index, self.max_len)
+        label_tensor = torch.tensor(label, dtype=torch.long)
 
-        # 입력은 정수 인덱스 시퀀스이므로 LongTensor 로 변환합니다.
-        x_tensor = torch.tensor(x, dtype=torch.long)
-
-        # CrossEntropyLoss 는 정답 라벨로 정수(LongTensor)를 받습니다. (IMDB: 0=neg, 1=pos)
-        y_tensor = torch.tensor(self.labels[index], dtype=torch.long)
-
-        return x_tensor, y_tensor
-# -------------------------------------------------
+        return input_ids, label_tensor
 
 
 # ---------------------------------------------------------------------
-# 4. PyTorch Lightning 기반 LSTM 모델 정의
+# 8. LightningDataModule 정의
 # ---------------------------------------------------------------------
 
-# RNNModel 은 LightningModule 을 상속합니다.
-# 모델 구조, 학습 단계, 검증 단계, 최적화 설정을 한 클래스 안에 정리합니다.
-class RNNModel(pl.LightningModule):
-    # 모델 계층을 초기화합니다.
+class IMDBDataModule(pl.LightningDataModule):
+    """데이터 준비와 DataLoader 생성을 담당하는 Lightning DataModule입니다."""
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        self.word_to_index: Dict[str, int] = {}
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+
+    def prepare_data(self) -> None:
+        pass
+
+    def setup(self, stage: str = None) -> None:
+        train_samples, test_samples = load_data(self.config)
+        self.word_to_index = build_vocab(train_samples, self.config)
+
+        full_train_dataset = IMDBDataset(train_samples, self.word_to_index, self.config.max_len)
+        self.test_dataset = IMDBDataset(test_samples, self.word_to_index, self.config.max_len)
+
+        val_size = int(len(full_train_dataset) * self.config.val_ratio)
+        train_size = len(full_train_dataset) - val_size
+
+        generator = torch.Generator().manual_seed(self.config.seed)
+
+        self.train_dataset, self.val_dataset = random_split(
+            full_train_dataset,
+            [train_size, val_size],
+            generator=generator,
+        )
+
+        print(f"[Dataset 준비 완료] train={len(self.train_dataset)}, val={len(self.val_dataset)}, test={len(self.test_dataset)}")
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+        )
+
+
+# ---------------------------------------------------------------------
+# 9. LSTM 모델 정의
+# ---------------------------------------------------------------------
+
+class LSTMClassifier(pl.LightningModule):
+    """IMDB 리뷰 감성 분석을 위한 LSTM 분류 모델입니다."""
+
     def __init__(
         self,
         vocab_size: int,
-        embedding_dim: int = 100,
-        hidden_size: int = 128,
-        output_size: int = 2,
-        lr: float = 1e-3,
+        embedding_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        dropout: float,
+        learning_rate: float,
+        pad_index: int = 0,
     ):
-        # 부모 클래스 초기화를 먼저 호출합니다. (Lightning 내부 기능에 필수)
         super().__init__()
-
-        # 하이퍼파라미터를 self.hparams 에 저장하고 체크포인트에도 기록합니다.
         self.save_hyperparameters()
+        self.learning_rate = learning_rate
 
-        # 학습 가능한 임베딩 계층입니다. padding_idx=0 은 <PAD> 토큰의 기울기를 0으로 고정합니다.
-        # 원본처럼 사전학습 벡터를 쓰지 않고, 데이터로부터 임베딩을 함께 학습합니다.
-        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.embedding = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=embedding_dim,
+            padding_idx=pad_index,
+        )
 
-        # LSTM 계층입니다. batch_first=True 로 두어 (배치, 시퀀스, 특징) 형태를 사용합니다.
-        # 이렇게 하면 원본처럼 permute 로 차원을 바꿔 줄 필요가 없습니다.
-        self.lstm = nn.LSTM(embedding_dim, hidden_size, batch_first=True)
+        self.lstm = nn.LSTM(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=False,
+        )
 
-        # LSTM 의 마지막 은닉 상태(hidden_size)를 클래스 점수(output_size)로 변환하는 출력층입니다.
-        self.lin = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_dim, 2)
+        self.loss_fn = nn.CrossEntropyLoss()
 
-        # 다중 클래스 분류용 손실 함수입니다. 내부에서 softmax 를 처리하므로 logits 를 그대로 넣습니다.
-        self.loss_function = nn.CrossEntropyLoss()
+        self.train_acc = BinaryAccuracy()
+        self.val_acc = BinaryAccuracy()
+        self.test_acc = BinaryAccuracy()
 
-        # 훈련/검증 정확도 계산 객체입니다.
-        self.train_accuracy = Accuracy(task="multiclass", num_classes=output_size)
-        self.val_accuracy = Accuracy(task="multiclass", num_classes=output_size)
-
-    # 순전파를 정의합니다. 입력 x 형태는 (배치, 시퀀스 길이) 입니다.
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 임베딩을 적용합니다. -> (배치, 시퀀스, 임베딩차원)
-        # nn.Embedding 은 모델 파라미터로 등록되어 model.to(device) 시 함께 이동하므로,
-        # 원본의 디바이스 불일치 버그(.to(self.device)를 인덱싱 뒤에 호출하던 문제)가 사라집니다.
-        x = self.embedding(x)
-
-        # LSTM 을 통과시킵니다.
-        # outputs: 모든 시점의 출력, (h_n, c_n): 마지막 은닉/셀 상태
-        outputs, (h_n, c_n) = self.lstm(x)
-
-        # 마지막 층의 마지막 은닉 상태를 문장 전체의 요약 벡터로 사용합니다. -> (배치, hidden_size)
-        # (원본은 모든 시점의 점수를 sum 했지만, 마지막 hidden 사용이 분류에서 더 일반적입니다.)
-        last_hidden = h_n[-1]
-
-        # ELU 활성화 함수로 비선형성을 추가합니다.
-        last_hidden = F.elu(last_hidden)
-
-        # 출력층을 통과시켜 클래스 점수(logits)를 만듭니다. -> (배치, output_size)
-        logits = self.lin(last_hidden)
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        embedded = self.embedding(input_ids)
+        output, (hidden, cell) = self.lstm(embedded)
+        sentence_vector = hidden[-1]
+        sentence_vector = self.dropout(sentence_vector)
+        logits = self.classifier(sentence_vector)
 
         return logits
 
-    # 훈련 배치 하나에 대한 연산을 정의합니다.
+    def _shared_step(self, batch, stage: str):
+        input_ids, labels = batch
+        logits = self(input_ids)
+        loss = self.loss_fn(logits, labels)
+        preds = torch.argmax(logits, dim=1)
+
+        if stage == "train":
+            acc = self.train_acc(preds, labels)
+        elif stage == "val":
+            acc = self.val_acc(preds, labels)
+        else:
+            acc = self.test_acc(preds, labels)
+
+        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+
+        return loss
+
     def training_step(self, batch, batch_idx):
-        # DataLoader 가 (입력, 라벨) 튜플을 돌려줍니다.
-        x, y = batch
+        return self._shared_step(batch, "train")
 
-        # 예측 점수를 계산합니다.
-        y_hat = self(x)
-
-        # 손실을 계산합니다.
-        loss = self.loss_function(y_hat, y)
-
-        # 훈련 정확도를 누적 계산합니다.
-        self.train_accuracy(y_hat, y)
-
-        # 손실과 정확도를 진행률 표시줄에 기록합니다.
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("train_acc", self.train_accuracy, prog_bar=True)
-
-        # 반환한 loss 로 Lightning 이 역전파와 파라미터 갱신을 수행합니다.
-        return loss
-
-    # 검증 배치 하나에 대한 연산을 정의합니다.
     def validation_step(self, batch, batch_idx):
-        x, y = batch
+        self._shared_step(batch, "val")
 
-        # 예측 점수를 계산합니다.
-        y_hat = self(x)
+    def test_step(self, batch, batch_idx):
+        self._shared_step(batch, "test")
 
-        # 검증 손실을 계산합니다.
-        loss = self.loss_function(y_hat, y)
-
-        # 검증 정확도를 누적 계산합니다.
-        self.val_accuracy(y_hat, y)
-
-        # 검증 손실과 정확도를 기록합니다.
-        self.log("val_loss", loss, prog_bar=True)
-        self.log("val_acc", self.val_accuracy, prog_bar=True)
-
-        return loss
-
-    # 최적화 알고리즘을 정의합니다.
     def configure_optimizers(self):
-        # Adam 옵티마이저를 사용합니다. 학습률은 생성자에서 받은 값(기본 0.001)을 사용합니다.
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
-# -------------------------------------------------
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        return optimizer
 
 
 # ---------------------------------------------------------------------
-# 5. 전체 실행 흐름
+# 10. 예측 함수
 # ---------------------------------------------------------------------
 
-# 데이터 준비, 모델 생성, 학습을 수행하는 메인 함수입니다.
+def predict_sentiment(model: LSTMClassifier, text: str, word_to_index: Dict[str, int], config: Config) -> Tuple[str, float]:
+    """학습된 모델로 문장 하나의 감성을 예측합니다."""
+
+    model.eval()
+
+    with torch.no_grad():
+        input_ids = encode_text(text, word_to_index, config.max_len)
+        input_ids = input_ids.unsqueeze(0)
+        input_ids = input_ids.to(model.device)
+
+        logits = model(input_ids)
+        probabilities = torch.softmax(logits, dim=1)
+        pred_id = torch.argmax(probabilities, dim=1).item()
+        confidence = probabilities[0, pred_id].item()
+
+    label = "positive" if pred_id == 1 else "negative"
+    return label, confidence
+
+
+# ---------------------------------------------------------------------
+# 11. main 함수
+# ---------------------------------------------------------------------
+
 def main() -> None:
-    # 난수 시드를 고정합니다.
-    set_seed(42)
+    """전체 실행 흐름을 담당하는 main 함수입니다."""
 
-    # 문장 최대 길이와 미니배치 크기를 설정합니다.
-    max_len = 200
-    batch_size = 32
+    config = Config()
+    pl.seed_everything(config.seed, workers=True)
 
-    # HuggingFace 에서 IMDB 데이터셋을 내려받습니다.
-    # 처음 실행 시 인터넷에서 다운로드하며, 이후에는 캐시를 재사용합니다.
-    print("IMDB 데이터셋을 불러오는 중...")
-    dataset = load_dataset("imdb")
+    data_module = IMDBDataModule(config)
+    data_module.setup(stage="fit")
 
-    # 훈련/테스트 문장과 라벨을 분리합니다. (label: 0=neg, 1=pos)
-    train_texts = dataset["train"]["text"]
-    train_labels = dataset["train"]["label"]
-    test_texts = dataset["test"]["text"]
-    test_labels = dataset["test"]["label"]
+    vocab_size = len(data_module.word_to_index)
 
-    # 첫 번째 훈련 샘플을 확인합니다.
-    print("\n[훈련 데이터 첫 번째 샘플 라벨]:", train_labels[0], "(0=neg, 1=pos)")
-    print("[첫 번째 샘플 앞부분]:", train_texts[0][:100], "...")
-
-    # 훈련 데이터로만 단어 사전을 만듭니다.
-    word_to_index = build_vocab(train_texts, min_freq=2, max_size=20000)
-    vocab_size = len(word_to_index)
-    print("\n[단어 집합(vocabulary) 크기]:", vocab_size)
-
-    # Dataset 객체를 만듭니다.
-    train_dataset = IMDBDataset(train_texts, train_labels, word_to_index, max_len)
-    test_dataset = IMDBDataset(test_texts, test_labels, word_to_index, max_len)
-
-    # DataLoader 를 만듭니다.
-    # Windows 에서는 num_workers>0 일 때 프로세스 spawn 이슈가 있을 수 있어 0으로 둡니다.
-    num_workers = 0
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
-    )
-    val_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
-    )
-
-    # 모델을 생성합니다. (output_size=2: 긍정/부정)
-    model = RNNModel(
+    model = LSTMClassifier(
         vocab_size=vocab_size,
-        embedding_dim=100,
-        hidden_size=128,
-        output_size=2,
-        lr=1e-3,
+        embedding_dim=config.embedding_dim,
+        hidden_dim=config.hidden_dim,
+        num_layers=config.num_layers,
+        dropout=config.dropout,
+        learning_rate=config.learning_rate,
+        pad_index=data_module.word_to_index["<pad>"],
     )
-    print(model)
 
-    # Trainer 를 생성합니다. (최신 Lightning 방식: accelerator/devices)
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+
     trainer = pl.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        max_epochs=config.max_epochs,
+        accelerator=accelerator,
         devices=1,
-        max_epochs=3,
+        log_every_n_steps=10,
+        enable_checkpointing=False,
     )
 
-    # 학습을 시작합니다. (DataLoader 를 fit 에 직접 전달)
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, datamodule=data_module)
+    trainer.test(model, datamodule=data_module)
+
+    examples = [
+        "This movie was fantastic and the acting was excellent.",
+        "The film was boring and the story was terrible.",
+    ]
+
+    print("\n[예측 예시]")
+    for text in examples:
+        label, confidence = predict_sentiment(model, text, data_module.word_to_index, config)
+        print(f"문장: {text}")
+        print(f"예측: {label}, 신뢰도: {confidence:.4f}\n")
 
 
-# 이 파일을 직접 실행할 때만 main() 을 실행합니다.
-# (Windows 에서 DataLoader/Trainer 의 프로세스 spawn 안전성을 위해 반드시 필요합니다.)
+# ---------------------------------------------------------------------
+# 12. 프로그램 시작 지점
+# ---------------------------------------------------------------------
+
 if __name__ == "__main__":
     main()
